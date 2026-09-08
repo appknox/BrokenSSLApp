@@ -12,18 +12,37 @@
 # from Appknox, and model turns through Sherrinford, which holds the provider
 # key. No source is uploaded to any model provider.
 #
-# workflow_dispatch ONLY. Never wire this to push or pull_request: every run
-# spends model budget, and on a public repository anyone able to open a PR could
-# otherwise spend it for you.
+# Never wire this to pull_request. A fixing run spends model budget, and on a
+# public repository anyone able to open a PR could then spend it for you. The
+# push trigger below is limited to one branch and cannot fix anything: with no
+# inputs it resolves to build-only.
 name: Appknox Autofix
 
 on:
+  # workflow_dispatch only registers once the file reaches a repository's
+  # DEFAULT branch. Where committing there is not on the table -- an org repo
+  # somebody else owns -- pushing this branch is the only way to trigger a run,
+  # which is why the push trigger exists alongside it.
+  #
+  # Safe because a push carries no inputs, and every input falls back to a
+  # build-only default (see the job env below): a push builds and stops. It
+  # never uploads, never calls KnoxIQ, and never spends model budget.
+  push:
+    branches: [ci/appknox-autofix]
   workflow_dispatch:
     inputs:
       javaVersion:
-        description: "JDK for the app build (8 for pre-2020 apps, 17 for modern)"
+        description: "JDK that RUNS Gradle (8 for Gradle<7, 17 for AGP 8, 21 for AGP 9)"
         required: false
         default: "17"
+      buildOnly:
+        description: "Stop after the build - no upload, scan, KnoxIQ or fix"
+        required: false
+        default: "false"
+      toolchainLadder:
+        description: "Offer Gradle every installed JDK. Set false if the build reports inconsistent JVM-target"
+        required: false
+        default: "true"
       appDir:
         description: "Directory holding gradlew (blank = repo root; e.g. InsecureBankv2)"
         required: false
@@ -69,6 +88,19 @@ env:
 jobs:
   autofix:
     runs-on: ubuntu-latest
+    # Every knob resolved ONCE here, so the steps below never have to care
+    # whether this run came from a dispatch or a push. On a push `inputs` is
+    # empty, and an empty string is falsy in a GitHub expression, so each
+    # fallback applies -- BUILD_ONLY becomes "true" and the run stops after the
+    # build. On a dispatch the input wins, including the literal string "false",
+    # which is truthy here and therefore not overridden.
+    env:
+      BUILD_ONLY: ${{ inputs.buildOnly || 'true' }}
+      LIST_ONLY: ${{ inputs.listAnalysesOnly || 'false' }}
+      LADDER: ${{ inputs.toolchainLadder || 'true' }}
+      JAVA_V: ${{ inputs.javaVersion || '17' }}
+      APP_DIR: ${{ inputs.appDir }}
+      REUSE_FILE_ID: ${{ inputs.fileId }}
     # Must exceed the KnoxIQ wait, or the job dies before the answer lands.
     timeout-minutes: 180
     permissions:
@@ -79,25 +111,64 @@ jobs:
       pull-requests: write
 
     steps:
+      # Submodules included: davx5-ose keeps its translations in one and fails
+      # its own verifyTranslations task without them. A shallow submodule fetch
+      # is cheap next to the Gradle build that follows.
       - uses: actions/checkout@v4
+        with:
+          submodules: recursive
 
+      # Skipped in buildOnly mode: nothing there calls the CLI, and building it
+      # costs about a minute on every run.
       - uses: actions/setup-go@v5
+        if: env.BUILD_ONLY != 'true'
         with:
           go-version: "1.24"
 
       - name: Build the appknox CLI
+        if: env.BUILD_ONLY != 'true'
         run: |
           git clone --depth 1 --branch "$AUTOFIX_CLI_REF" \
             https://github.com/appknox/appknox-go.git /tmp/appknox-go
           cd /tmp/appknox-go && go build -o /usr/local/bin/appknox .
           appknox --help >/dev/null && echo "CLI built from $AUTOFIX_CLI_REF"
 
-      - name: Set up JDK
-        if: inputs.fileId == ''
+      # TWO JDK concerns, routinely confused, and a single install cannot serve
+      # both:
+      #
+      #   1. The JDK that RUNS Gradle. Old Gradle cannot run on a new JDK at all
+      #      (Gradle 4.x needs 8), and AGP 8/9 refuse to run on an old one.
+      #   2. The JDK that COMPILES the code. AGP derives a Java toolchain from
+      #      compileOptions, and Gradle matches a toolchain EXACTLY -- a request
+      #      for 18 is not satisfied by 21. termux-app wants Gradle on 17+ while
+      #      targeting Java 8; allsafe-android wants a toolchain of exactly 18.
+      #
+      # So: install a ladder of JDKs for toolchain resolution, then install the
+      # requested one LAST so it wins JAVA_HOME and runs Gradle. The build step
+      # points Gradle at the ladder via org.gradle.java.installations.fromEnv,
+      # which older Gradle simply ignores as an unknown system property.
+      # Gated on toolchainLadder because INSTALLING the JDKs is what matters,
+      # not just advertising them: Gradle auto-detects installed JVMs, so
+      # omitting the -D flag while still installing five of them left
+      # element-android resolving compileJava to 21 against compileKotlin's 17.
+      - name: Install the toolchain JDK ladder
+        if: env.REUSE_FILE_ID == '' && env.LADDER != 'false'
         uses: actions/setup-java@v4
         with:
           distribution: temurin
-          java-version: ${{ inputs.javaVersion || '17' }}
+          java-version: |
+            8
+            11
+            17
+            18
+            21
+
+      - name: Set up the JDK that runs Gradle
+        if: env.REUSE_FILE_ID == ''
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ env.JAVA_V }}
 
       # Corpus repos disagree about almost everything: bundle vs assemble, one
       # variant vs a flavour matrix, app/ vs a differently named module. So the
@@ -105,22 +176,96 @@ jobs:
       # afterwards rather than assumed.
       - name: Build the app
         id: build
-        if: inputs.fileId == ''
+        if: env.REUSE_FILE_ID == ''
         run: |
           set -o pipefail
           # Most corpus repos keep the Gradle project in a subdirectory -- the app
           # sits beside exploit code, a second flavour of the same app, or docs.
           # Quoted throughout: at least one of them has a space in the path.
-          app_dir="${{ inputs.appDir }}"
+          app_dir="${APP_DIR}"
           cd "${app_dir:-.}"
           echo "building in $(pwd)"
+
+          # Offer Gradle every installed JDK, so a toolchain request for an exact
+          # version can be met by something other than the JDK running Gradle.
+          # Unknown to Gradle < 6.7, which ignores it rather than failing.
+          #
+          # Disable it for a build that reports "Inconsistent JVM-target
+          # compatibility": with several JDKs visible the Java and Kotlin
+          # compilers can independently resolve to DIFFERENT ones, which is a
+          # worse failure than the single-JDK case the ladder was added to fix.
+          # element-android is the example -- compileJava landed on 21 while
+          # compileKotlin stayed on 17.
+          TOOLCHAINS=""
+          if [ "$LADDER" = "true" ]; then
+            TOOLCHAINS="-Dorg.gradle.java.installations.fromEnv=JAVA_HOME_8_X64,JAVA_HOME_11_X64,JAVA_HOME_17_X64,JAVA_HOME_18_X64,JAVA_HOME_21_X64"
+          fi
+
+          # Accept Android SDK licences before Gradle asks for them, and install
+          # the platform the project pins. Runners carry only what they ship, so
+          # a project wanting another NDK fails with LicenceNotAcceptedException
+          # (ovaa) and one wanting an older platform fails with "failed to find
+          # target with hash string 'android-N'" (diva-android, android-23).
+          # Both read like broken apps and are missing runner packages.
+          #
+          # Never fatal: an image without sdkmanager must not stop a build that
+          # needs no extra package.
+          SDK="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-/usr/local/lib/android/sdk}}"
+          MGR=""
+          # `|| true` again: without a match the loop's status is the last failed
+          # test, which set -e would treat as a build failure.
+          for m in "$SDK/cmdline-tools/latest/bin/sdkmanager" \
+                   "$SDK/cmdline-tools/bin/sdkmanager" \
+                   "$SDK/tools/bin/sdkmanager"; do
+            if [ -x "$m" ]; then MGR="$m"; break; fi
+          done || true
+          # sdkmanager is a modern Java program and will not start on JDK 8, so
+          # it cannot inherit JAVA_HOME from a build that needs an old one --
+          # diva-android builds on 8 and sdkmanager died with a ClassLoader
+          # error, leaving android-23 uninstalled and the failure looking like a
+          # broken app. Give it its own JDK, falling back to JAVA_HOME when the
+          # ladder was not installed.
+          SDKJAVA="${JAVA_HOME_17_X64:-${JAVA_HOME_21_X64:-$JAVA_HOME}}"
+          if [ -n "$MGR" ]; then
+            yes | env JAVA_HOME="$SDKJAVA" "$MGR" --licenses >/dev/null 2>&1 || true
+            # Lowest pinned compileSdk: the oldest is the one a modern runner is
+            # most likely to be missing.
+            #
+            # The `|| true` is load-bearing. This step runs under `bash -e` with
+            # pipefail, so a grep that matches NOTHING returns 1, the command
+            # substitution inherits it, and set -e kills the build -- meaning
+            # every repo whose compileSdk this pattern misses would fail because
+            # of the fix rather than despite it. That is exactly what happened
+            # to davx5-ose and element-android.
+            csdk=$( { grep -rhoE 'compileSdk(Version)?[ =]+[0-9]+' \
+                        --include=build.gradle --include=build.gradle.kts . 2>/dev/null \
+                      | grep -oE '[0-9]+' | sort -un | head -1; } || true )
+            if [ -n "$csdk" ]; then
+              # Logged, not silenced: an install that fails because the platform
+              # is no longer published looks identical to one that never ran.
+              echo "ensuring platforms;android-$csdk"
+              yes | env JAVA_HOME="$SDKJAVA" "$MGR" "platforms;android-$csdk" 2>&1 | tail -3 || true
+            fi
+            # Build tools are a separate package from the platform, and an old
+            # project pins an old revision: diva-android got past "failed to
+            # find target android-23" only to stop at "failed to find Build
+            # Tools revision 23.0.2".
+            btv=$( { grep -rhoE 'buildToolsVersion[ =]+"[0-9.]+"' \
+                       --include=build.gradle --include=build.gradle.kts . 2>/dev/null \
+                     | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | sort -uV | head -1; } || true )
+            if [ -n "$btv" ]; then
+              echo "ensuring build-tools;$btv"
+              yes | env JAVA_HOME="$SDKJAVA" "$MGR" "build-tools;$btv" 2>&1 | tail -3 || true
+            fi
+          fi
 
           chmod +x ./gradlew
           task="${{ inputs.gradleTask }}"
           if [ -n "$task" ]; then
-            ./gradlew --no-daemon "$task"
+            ./gradlew --no-daemon $TOOLCHAINS "$task"
           else
-            ./gradlew --no-daemon bundle || ./gradlew --no-daemon assembleDebug
+            ./gradlew --no-daemon $TOOLCHAINS bundle \
+              || ./gradlew --no-daemon $TOOLCHAINS assembleDebug
           fi
 
           # Searched from the repo root, so the path recorded is repo-relative
@@ -139,8 +284,13 @@ jobs:
           echo "artifact=$artifact" >> "$GITHUB_OUTPUT"
           echo "built $artifact"
 
+      # buildOnly stops here. Build triage across a corpus is a separate
+      # question from fixing anything, and it must stay answerable while the
+      # Appknox API is unreachable -- otherwise an upload outage looks
+      # indistinguishable from an app that does not compile.
       - name: Upload to Appknox
         id: upload
+        if: env.BUILD_ONLY != 'true'
         env:
           APPKNOX_ACCESS_TOKEN: ${{ secrets.APPKNOX_ACCESS_TOKEN }}
         run: |
@@ -155,6 +305,7 @@ jobs:
           echo "uploaded as file ${file_id}"
 
       - name: Wait for the static scan
+        if: env.BUILD_ONLY != 'true'
         env:
           APPKNOX_ACCESS_TOKEN: ${{ secrets.APPKNOX_ACCESS_TOKEN }}
         run: |
@@ -165,7 +316,7 @@ jobs:
             --risk-threshold critical --host "$APPKNOX_API_HOST" || true
 
       - name: What is and is not a fix target
-        if: inputs.listAnalysesOnly == 'true'
+        if: env.BUILD_ONLY != 'true' && env.LIST_ONLY == 'true'
         env:
           APPKNOX_ACCESS_TOKEN: ${{ secrets.APPKNOX_ACCESS_TOKEN }}
         run: |
@@ -182,7 +333,7 @@ jobs:
       # wait up to two hours on a service it does not depend on, and a KnoxIQ
       # timeout destroyed the verification result along with the fixes.
       - name: Did the previous run's fixes hold?
-        if: inputs.listAnalysesOnly != 'true'
+        if: env.BUILD_ONLY != 'true' && env.LIST_ONLY != 'true'
         env:
           APPKNOX_ACCESS_TOKEN: ${{ secrets.APPKNOX_ACCESS_TOKEN }}
         run: |
@@ -249,7 +400,7 @@ jobs:
       # Only autofix needs KnoxIQ: it writes the per-finding remediation and
       # validation the fixer reads, and there is nothing to read until it lands.
       - name: Wait for the KnoxIQ analysis
-        if: inputs.listAnalysesOnly != 'true'
+        if: env.BUILD_ONLY != 'true' && env.LIST_ONLY != 'true'
         env:
           APPKNOX_ACCESS_TOKEN: ${{ secrets.APPKNOX_ACCESS_TOKEN }}
         run: |
@@ -276,7 +427,7 @@ jobs:
       # successful runs -- across a corpus most runs are one of those, and
       # failing them would paint healthy repositories red.
       - name: Autofix every finding
-        if: inputs.listAnalysesOnly != 'true'
+        if: env.BUILD_ONLY != 'true' && env.LIST_ONLY != 'true'
         env:
           APPKNOX_ACCESS_TOKEN: ${{ secrets.APPKNOX_ACCESS_TOKEN }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
