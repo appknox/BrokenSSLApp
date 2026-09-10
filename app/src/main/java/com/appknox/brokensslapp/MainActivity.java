@@ -8,9 +8,14 @@ import android.util.Log;
 import android.view.View;
 import android.webkit.WebView;
 import android.webkit.WebViewClient;
+import com.appknox.brokensslapp.BuildConfig;
 
 import javax.net.ssl.HostnameVerifier;
 import javax.net.ssl.HttpsURLConnection;
+
+import java.io.BufferedReader;
+import java.io.InputStreamReader;
+import java.net.URL;
 
 import org.apache.http.HttpResponse;
 import org.apache.http.client.methods.HttpPost;
@@ -55,7 +60,9 @@ public class MainActivity extends AppCompatActivity {
                     final String url = "https://www.google.com/";
                     HttpPost httpPost = new HttpPost(url);
                     HttpResponse response = httpClient.execute(httpPost);
-                    Log.d("Response", response.toString());
+                    if (BuildConfig.DEBUG) {
+                        Log.d("Response", "HTTP response received.");
+                    }
                 } catch (Exception e) {
                     e.printStackTrace();
                 }
@@ -79,19 +86,18 @@ public class MainActivity extends AppCompatActivity {
             @Override
             public void run() {
                 try  {
-                    HostnameVerifier hostnameVerifier = SSLSocketFactory.ALLOW_ALL_HOSTNAME_VERIFIER;
                     DefaultHttpClient client = new DefaultHttpClient();
                     SchemeRegistry registry = new SchemeRegistry();
                     SSLSocketFactory socketFactory = MySSLSocketFactory.getSocketFactory();
-                    socketFactory.setHostnameVerifier((X509HostnameVerifier) hostnameVerifier);
                     registry.register(new Scheme("https", socketFactory, 443));
                     SingleClientConnManager mgr = new SingleClientConnManager(client.getParams(), registry);
                     DefaultHttpClient httpClient = new DefaultHttpClient(mgr, client.getParams());
-                    HttpsURLConnection.setDefaultHostnameVerifier(hostnameVerifier);
                     final String url = "https://www.google.org/";
                     HttpPost httpPost = new HttpPost(url);
                     HttpResponse response = httpClient.execute(httpPost);
-                    Log.d("Response", response.toString());
+                    if (BuildConfig.DEBUG) {
+                        Log.d("Response", "HTTP response received.");
+                    }
                 } catch (Exception e) {
                     e.printStackTrace();
                 }
@@ -105,16 +111,19 @@ public class MainActivity extends AppCompatActivity {
             @Override
             public void run() {
                 try  {
-                    DefaultHttpClient client = new DefaultHttpClient();
-                    SchemeRegistry registry = new SchemeRegistry();
-                    javax.net.ssl.SSLSocketFactory socketFactory = SSLCertificateSocketFactory.getInsecure(6000, new SSLSessionCache(view.getContext()));
-                    registry.register(new Scheme("https", (SocketFactory) socketFactory, 443));
-                    SingleClientConnManager mgr = new SingleClientConnManager(client.getParams(), registry);
-                    DefaultHttpClient httpClient = new DefaultHttpClient(mgr, client.getParams());
-                    final String url = "https://www.google.org/";
-                    HttpPost httpPost = new HttpPost(url);
-                    HttpResponse response = httpClient.execute(httpPost);
-                    Log.d("Response", response.toString());
+                    URL url = new URL("https://www.google.org/");
+                    HttpsURLConnection urlConnection = (HttpsURLConnection) url.openConnection();
+                    try {
+                        BufferedReader reader = new BufferedReader(new InputStreamReader(urlConnection.getInputStream()));
+                        StringBuilder stringBuilder = new StringBuilder();
+                        String line;
+                        while ((line = reader.readLine()) != null) {
+                            stringBuilder.append(line).append("\n");
+                        }
+                        Log.d("Response", stringBuilder.toString());
+                    } finally {
+                        urlConnection.disconnect();
+                    }
                 } catch (Exception e) {
                     e.printStackTrace();
                 }
