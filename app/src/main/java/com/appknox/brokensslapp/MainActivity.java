@@ -79,15 +79,12 @@ public class MainActivity extends AppCompatActivity {
             @Override
             public void run() {
                 try  {
-                    HostnameVerifier hostnameVerifier = SSLSocketFactory.ALLOW_ALL_HOSTNAME_VERIFIER;
                     DefaultHttpClient client = new DefaultHttpClient();
                     SchemeRegistry registry = new SchemeRegistry();
                     SSLSocketFactory socketFactory = MySSLSocketFactory.getSocketFactory();
-                    socketFactory.setHostnameVerifier((X509HostnameVerifier) hostnameVerifier);
                     registry.register(new Scheme("https", socketFactory, 443));
                     SingleClientConnManager mgr = new SingleClientConnManager(client.getParams(), registry);
                     DefaultHttpClient httpClient = new DefaultHttpClient(mgr, client.getParams());
-                    HttpsURLConnection.setDefaultHostnameVerifier(hostnameVerifier);
                     final String url = "https://www.google.org/";
                     HttpPost httpPost = new HttpPost(url);
                     HttpResponse response = httpClient.execute(httpPost);
